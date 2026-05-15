@@ -195,6 +195,161 @@ class StructuredOutputManager:
                 # requests here.
                 self._grammar_bitmask[index].fill_(self._full_mask)
 
+    def _init_reasoning_ended(
+        self,
+        request: "Request",
+        reasoner: "ReasoningParser",
+    ) -> bool:
+        structured_req = request.structured_output_request
+        assert structured_req is not None
+        if structured_req.reasoning_ended is None:
+            # Preserve the existing prompt-level initialization. Some clients
+            # pass a request that has already exited reasoning before decode
+            # starts, and those requests should be constrained immediately.
+            structured_req.reasoning_ended = reasoner.is_reasoning_end(
+                request.prompt_token_ids or []
+            )
+        return structured_req.reasoning_ended
+
+    def _find_reasoning_end_in_tokens(
+        self,
+        request: "Request",
+        token_ids: list[int],
+        *,
+        tokens_already_appended: bool,
+    ) -> int | None:
+        """Return the offset of the reasoning-end token inside token_ids.
+
+        MTP can accept a batch containing both the reasoning-end marker and
+        visible answer tokens after it. The old boolean gate only noticed that
+        reasoning had ended, so those visible suffix tokens escaped xgrammar.
+        This scans the small per-step token list so callers can split:
+        - unconstrained reasoning prefix through the end marker, and
+        - constrained visible suffix after the marker.
+        """
+        if not token_ids:
+            return None
+
+        reasoner = self._get_reasoner(request)
+        if reasoner is None or self.enable_in_reasoning:
+            return None
+
+        structured_req = request.structured_output_request
+        assert structured_req is not None
+        if self._init_reasoning_ended(request, reasoner):
+            return None
+
+        all_token_ids = request.all_token_ids
+        base_token_ids = all_token_ids
+        if tokens_already_appended:
+            if (
+                len(token_ids) <= len(all_token_ids)
+                and all_token_ids[-len(token_ids) :] == token_ids
+            ):
+                base_token_ids = all_token_ids[: -len(token_ids)]
+            else:
+                logger.debug(
+                    "Structured output reasoning gate expected request %s to end "
+                    "with generated tokens %s, but all_token_ids ended with %s.",
+                    request.request_id,
+                    token_ids,
+                    all_token_ids[-len(token_ids) :] if token_ids else [],
+                )
+
+        for index in range(len(token_ids)):
+            delta_ids = token_ids[: index + 1]
+            candidate_token_ids = [*base_token_ids, *delta_ids]
+            if reasoner.is_reasoning_end_streaming(candidate_token_ids, delta_ids):
+                return index
+        return None
+
+    def identify_constrained_token_ids(
+        self,
+        request: "Request",
+        token_ids: list[int],
+        *,
+        tokens_already_appended: bool = False,
+    ) -> tuple[list[int], list[int]]:
+        """Split token_ids into unconstrained reasoning and constrained content."""
+        if not token_ids:
+            return [], []
+        if not request.use_structured_output:
+            return token_ids, []
+
+        reasoner = self._get_reasoner(request)
+        if reasoner is None or self.enable_in_reasoning:
+            return [], token_ids
+
+        if self._init_reasoning_ended(request, reasoner):
+            return [], token_ids
+
+        reasoning_end_index = self._find_reasoning_end_in_tokens(
+            request, token_ids, tokens_already_appended=tokens_already_appended
+        )
+        if reasoning_end_index is None:
+            return token_ids, []
+
+        first_constrained_index = reasoning_end_index + 1
+        return token_ids[:first_constrained_index], token_ids[first_constrained_index:]
+
+    def get_grammar_advance_token_ids(
+        self, request: "Request", new_token_ids: list[int]
+    ) -> list[int]:
+        """Return only the visible tokens that should advance the grammar.
+
+        This is called after target-model output has been appended, so this is the
+        one place where detecting a reasoning-end marker should commit
+        reasoning_ended=True.
+        """
+        if not request.use_structured_output:
+            return []
+
+        reasoner = self._get_reasoner(request)
+        if reasoner is None or self.enable_in_reasoning:
+            return new_token_ids
+
+        structured_req = request.structured_output_request
+        assert structured_req is not None
+
+        if self._init_reasoning_ended(request, reasoner):
+            return new_token_ids
+
+        reasoning_end_index = self._find_reasoning_end_in_tokens(
+            request,
+            new_token_ids,
+            tokens_already_appended=True,
+        )
+        if reasoning_end_index is None:
+            return []
+
+        structured_req.reasoning_ended = True
+        return new_token_ids[reasoning_end_index + 1 :]
+
+    def validate_tokens_reasoning_aware(
+        self, request: "Request", token_ids: list[int]
+    ) -> list[int]:
+        """Validate speculative tokens without constraining reasoning tokens."""
+        unconstrained_token_ids, constrained_token_ids = (
+            self.identify_constrained_token_ids(request, token_ids)
+        )
+        if not constrained_token_ids:
+            return unconstrained_token_ids
+
+        structured_req = request.structured_output_request
+        assert structured_req is not None and structured_req.grammar is not None
+        validated_token_ids = structured_req.grammar.validate_tokens(
+            constrained_token_ids
+        )
+        if len(validated_token_ids) != len(constrained_token_ids):
+            logger.debug(
+                "Structured output grammar trimmed speculative visible tokens "
+                "for request %s: original suffix=%s validated suffix=%s.",
+                request.request_id,
+                constrained_token_ids,
+                validated_token_ids,
+            )
+        return [*unconstrained_token_ids, *validated_token_ids]
+
     def _async_submit_fill_bitmask(
         self, batch: list[tuple[StructuredOutputGrammar, int, bool]]
     ) -> Future:
@@ -272,16 +427,30 @@ class StructuredOutputManager:
                     assert structured_output_request is not None
                     assert structured_output_request.grammar is not None
                 grammar = structured_output_request.grammar
+                req_tokens = list(scheduled_spec_decode_tokens.get(req_id, ()))
+
+                # In MTP, req_tokens have not been appended yet. If reasoning
+                # ends inside them, rows before and including the end token stay
+                # unmasked; later draft rows and the bonus row use xgrammar.
                 apply_bitmask = self.should_fill_bitmask(request)
+                reasoning_end_index = None
+                if req_tokens and not apply_bitmask:
+                    reasoning_end_index = self._find_reasoning_end_in_tokens(
+                        request, req_tokens, tokens_already_appended=False
+                    )
+                    if reasoning_end_index is not None:
+                        apply_bitmask = True
 
                 state_advancements = 0
-                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
-                for token in itertools.chain(req_tokens, (-1,)):
-                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
-                    if token == -1:
-                        # Stop advancing the grammar once we hit a padding token.
-                        apply_bitmask = False
-                    if apply_bitmask and not grammar.is_terminated():
+                for spec_index, token in enumerate(itertools.chain(req_tokens, (-1,))):
+                    row_apply_bitmask = apply_bitmask
+                    if reasoning_end_index is not None:
+                        row_apply_bitmask = spec_index > reasoning_end_index
+
+                    self._fill_bitmasks(
+                        ((grammar, cumulative_index, row_apply_bitmask),)
+                    )
+                    if token != -1 and row_apply_bitmask and not grammar.is_terminated():
                         accepted = grammar.accept_tokens(req_id, [token])
                         assert accepted, (token, req_id, scheduled_spec_decode_tokens)
                         state_advancements += 1
@@ -306,19 +475,10 @@ class StructuredOutputManager:
         if reasoner is not None:
             if self.enable_in_reasoning:
                 return True
-            assert request.structured_output_request is not None
-            if request.structured_output_request.reasoning_ended is None:
-                # This should be removed here, but since `openai_gptoss`
-                # is an independent code path, it is kept for now.
-                # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
-                # it can be removed.
-                request.structured_output_request.reasoning_ended = (
-                    reasoner.is_reasoning_end(request.prompt_token_ids or [])
-                )
-            return request.structured_output_request.reasoning_ended
+            return self._init_reasoning_ended(request, reasoner)
         return True
 
-    def should_advance(self, request: "Request") -> bool:
+    def should_advance(self, request: "Request", new_token_ids: list[int] | None = None,) -> bool:
         if not request.use_structured_output:
             return False
 
@@ -337,22 +497,26 @@ class StructuredOutputManager:
         if self.enable_in_reasoning:
             return True
 
-        structured_req = request.structured_output_request
-        if structured_req.reasoning_ended:
+        if self._init_reasoning_ended(request, reasoner):
             return True
 
         # Check if reasoning ends in *this* step
-        delta_from = request.num_computed_tokens - request.num_output_placeholders
-        all_token_ids = request.all_token_ids
-        start = (
-            delta_from if delta_from >= 0 else max(len(all_token_ids) + delta_from, 0)
+        if new_token_ids is None:
+            delta_from = request.num_computed_tokens - request.num_output_placeholders
+            all_token_ids = request.all_token_ids
+            start = (
+                delta_from
+                if delta_from >= 0
+                else max(len(all_token_ids) + delta_from, 0)
+            )
+            new_token_ids = list(itertools.islice(all_token_ids, start, None))
+        reasoning_end_index = self._find_reasoning_end_in_tokens(
+            request,
+            new_token_ids,
+            tokens_already_appended=True,
         )
-        if reasoner.is_reasoning_end_streaming(
-            all_token_ids, itertools.islice(all_token_ids, start, None)
-        ):
-            # Reasoning just ended, so we shouldn't advance til
-            # next pass
-            structured_req.reasoning_ended = True
+        if reasoning_end_index is not None:
+            request.structured_output_request.reasoning_ended = True
 
         return False
 
